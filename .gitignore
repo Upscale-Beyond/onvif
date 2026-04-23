@@ -416,3 +416,10 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Connector package output and binaries
+package/
+*.exe
+*.dll
+*.so
+*.dylib
