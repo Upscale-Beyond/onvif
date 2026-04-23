@@ -1,0 +1,18 @@
+{
+    "name": "Onvif",
+    "definition": "Onvif camera streaming connector",
+    "provider": "Upscale Beyond",
+    "version": "1.1.0.0",
+    "settings": [
+        { "key": "DefaultUsername", "type": "string" },
+        { "key": "DefaultPassword", "type": "string" }
+    ],
+    "devices": [],
+    "requiredRights": [
+        "VARIABLESET",
+        "VARIABLEMANAGE",
+        "CONNECTORAPP",
+        "EYESTREAMER",
+        "LOGMANAGE"
+    ]
+}
