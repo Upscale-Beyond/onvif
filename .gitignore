@@ -423,3 +423,4 @@ package/binaries
 *.dll
 *.so
 *.dylib
+*.DS_Store
