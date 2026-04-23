@@ -185,8 +185,8 @@ public class OnvifCamera
 
     private (string username, string password) ResolveCredentials()
     {
-        var username = Variable.FindSetting("OverrideUsername", "")?.ToString() ?? "";
-        var password = Variable.FindSetting("OverridePassword", "")?.ToString() ?? "";
+        var username = Variable.FindSetting("User", "")?.ToString() ?? "";
+        var password = Variable.FindSetting("Password", "")?.ToString() ?? "";
 
         if (string.IsNullOrEmpty(username))
         {

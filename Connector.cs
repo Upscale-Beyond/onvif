@@ -179,9 +179,7 @@ public class Connector : StreamerConnector
                 var result = await _client.VariableService().AddAsync(variable);
                 result.Settings = new List<Setting>
                 {
-                    new() { Key = "Identifier", Value = deviceAddress },
-                    new() { Key = "OverrideUsername", Value = "", Type = "string" },
-                    new() { Key = "OverridePassword", Value = "", Type = "password" }
+                    new() { Key = "Identifier", Value = deviceAddress }
                 };
                 result.OpenWithApp = "eye-viewer";
                 await _client.VariableService().UpdateAsync(result);
