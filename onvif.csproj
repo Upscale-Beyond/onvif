@@ -17,6 +17,8 @@
   </PropertyGroup>
 
   <ItemGroup Condition="'$(Configuration)' == 'Release'">
+  <PackageReference Include="Onvif.Core" Version="3.0.0" />
+    <PackageReference Include="OnvifDiscovery" Version="2.1.1" />
     <PackageReference Include="Quantum.DevKit" Version="1.1.0">
         <Private>false</Private>
         <ExcludeAssets>runtime</ExcludeAssets>
