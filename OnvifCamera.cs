@@ -50,7 +50,8 @@ public class OnvifCamera
             _onvifClient = new OnvifClient(address, username, password);
             await _onvifClient.ConnectAsync();
 
-            var rtspUrl = InjectCredentials(await _onvifClient.GetStreamUriAsync(), username, password);
+            var profileToken = Variable.FindSetting("ProfileToken", "")?.ToString();
+            var rtspUrl = InjectCredentials(await _onvifClient.GetStreamUriAsync(profileToken), username, password);
 
             _streamHandle = _connector.StartStreamRelay(rtspUrl, Variable);
 
@@ -108,7 +109,8 @@ public class OnvifCamera
             using (var client = new OnvifClient(address, username, password))
             {
                 await client.ConnectAsync();
-                rtspUrl = InjectCredentials(await client.GetStreamUriAsync(), username, password);
+                var profileToken = Variable.FindSetting("ProfileToken", "")?.ToString();
+                rtspUrl = InjectCredentials(await client.GetStreamUriAsync(profileToken), username, password);
             }
 
             var playbackPath = $"{_client.Connector.Name}/{Variable.Name}/playback/{playback.SessionId}";

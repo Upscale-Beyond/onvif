@@ -5,7 +5,9 @@
     "version": "1.1.0.0",
     "settings": [
         { "key": "DefaultUsername", "type": "string" },
-        { "key": "DefaultPassword", "type": "string" }
+        { "key": "DefaultPassword", "type": "password" },
+        { "key": "EnablePeriodicDiscovery", "type": "boolean" },
+        { "key": "RootName", "type": "string" }
     ],
     "devices": [],
     "requiredRights": [

@@ -33,12 +33,22 @@ public class OnvifClient : IDisposable
         _profileToken = _camera.Profile?.token;
     }
 
-    public async Task<string> GetStreamUriAsync()
+    public async Task<IEnumerable<(string Token, string Name)>> GetProfilesAsync()
     {
         if (_camera == null)
             throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
 
-        if (string.IsNullOrEmpty(_profileToken))
+        var response = await _camera.Media.GetProfilesAsync();
+        return response.Profiles.Select(p => (p.token, p.Name));
+    }
+
+    public async Task<string> GetStreamUriAsync(string? profileToken = null)
+    {
+        if (_camera == null)
+            throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
+
+        var token = profileToken ?? _profileToken;
+        if (string.IsNullOrEmpty(token))
             throw new InvalidOperationException("No media profile available on device.");
 
         var streamSetup = new StreamSetup
@@ -47,7 +57,7 @@ public class OnvifClient : IDisposable
             Transport = new Transport { Protocol = TransportProtocol.RTSP }
         };
 
-        var uri = await _camera.Media.GetStreamUriAsync(streamSetup, _profileToken);
+        var uri = await _camera.Media.GetStreamUriAsync(streamSetup, token);
         return uri?.Uri ?? throw new Exception("Failed to get stream URI from device.");
     }
 
@@ -76,7 +86,7 @@ public class OnvifClient : IDisposable
             Zoom = new Vector1D { x = zoom * speed }
         };
 
-        await _camera.Ptz.ContinuousMoveAsync(_profileToken, velocity, TimeSpan.FromSeconds(5));
+        await _camera.Ptz.ContinuousMoveAsync(_profileToken, velocity, null);
     }
 
     public async Task StopAsync()

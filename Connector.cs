@@ -14,16 +14,31 @@ public class Connector : StreamerConnector
     private readonly Dictionary<string, OnvifCamera> _cameras = new();
 
     private NotificationEventListener<Variable>? _variableEvents;
+    private NotificationEventListener<Quantum.DevKit.Models.Sense.Connector>? _connectorEvents;
 
+    private string _rootName;
     public override async Task InitAsync(Client client)
     {
         SetClient(client);
 
         _variableEvents = client.VariableService(true).Events!;
+        _connectorEvents = client.ConnectorService(true).Events!;
         _variableEvents.On("added", HandleVariableAdded);
         _variableEvents.On("updated", HandleVariableUpdated);
         _variableEvents.On("removed", HandleVariableRemoved);
+        _connectorEvents.On("updated", HandleConnectorUpdated);
         _cache.AddRange(await _client.GetMyVariablesAsync());
+        _rootName = _client.Connector.FindSetting("RootName", _client.Connector.Name).ToString()!;
+
+        var exists = await _client.VariableService().FindAsync(_rootName);
+        if (exists == null)
+        {
+            await _client.VariableService().AddAsync(new()
+            {
+                Name = _rootName,
+                Comment = $"Connector {_client.Connector.Name}'s root variable"
+            });
+        }
 
         await DiscoverOnvifDevicesAsync();
     }
@@ -34,8 +49,9 @@ public class Connector : StreamerConnector
 
         foreach (var variable in _cache)
         {
-            var identifier = variable.FindSetting("Identifier", "").ToString();
-            if (string.IsNullOrEmpty(identifier)) continue;
+            var identifier = variable.FindSetting("Identifier", "")?.ToString() ?? "";
+            var profileToken = variable.FindSetting("ProfileToken", "")?.ToString() ?? "";
+            if (string.IsNullOrEmpty(identifier) || string.IsNullOrEmpty(profileToken)) continue;
 
             var camera = new OnvifCamera(variable.Name, variable, _client, this);
             _cameras[variable.Name] = camera;
@@ -96,73 +112,143 @@ public class Connector : StreamerConnector
                 break;
             }
 
+            var enabled = (_client.Connector.Settings ?? []).Find(s => s.Key == "EnablePeriodicDiscovery")?.Value;
+            if (enabled is not true) continue;
+
             try
             {
                 await DiscoverOnvifDevicesAsync();
             }
             catch (Exception ex)
             {
-                _ = _client.LogService().LogError("Onvif", $"Periodic discovery failed: {ex.Message}");
+                _ = _client.LogService().LogError(_client.Connector.Name, $"Periodic discovery failed: {ex.Message}");
             }
         }
     }
 
     private async Task DiscoverOnvifDevicesAsync()
     {
-        var settings = _client.Connector.Settings ?? [];
-        var defaultUsername = settings.Find(s => s.Key == "DefaultUsername")?.Value?.ToString() ?? "";
-        var defaultPassword = settings.Find(s => s.Key == "DefaultPassword")?.Value?.ToString() ?? "";
-
-        List<DiscoveryDevice> devices;
-        try
-        {
-            var discovery = new Discovery();
-            var result = discovery.DiscoverAsync(5);
-            devices = new();
-            await foreach (var device in result)
-            {
-                devices.Add(device);
-            }
-
-            await _client.LogService().LogInformation("Onvif", $"Discovered {devices.Count} device(s) on the network.");
-        }
-        catch (Exception ex)
-        {
-            await _client.LogService().LogError("Onvif", $"WS-Discovery failed: {ex.Message}");
-            return;
-        }
+        var connSettings = _client.Connector.Settings ?? [];
+        var defaultUsername = connSettings.Find(s => s.Key == "DefaultUsername")?.Value?.ToString() ?? "";
+        var defaultPassword = connSettings.Find(s => s.Key == "DefaultPassword")?.Value?.ToString() ?? "";
 
         var cameraType = await _client.DataTypeService().FindWithFilterAsync(Filter.Create(f => f.Eq("Name", "Camera").Eq("IsSystem", true)));
         if (cameraType == null)
         {
-            await _client.LogService().LogError("Onvif", "System Camera DataType not found. Cannot create variables.");
+            await _client.LogService().LogError(_client.Connector.Name, "System Camera DataType not found. Cannot create variables.");
             return;
         }
 
-        var existingByIdentifier = _cache
-            .Select(v => new { Variable = v, Id = v.FindSetting("Identifier", "")?.ToString() ?? "" })
-            .Where(x => !string.IsNullOrEmpty(x.Id))
-            .ToDictionary(x => x.Id, x => x.Variable);
+        // Real stream variables have a non-empty ProfileToken
+        var existingStreams = _cache
+            .Where(v => !string.IsNullOrEmpty(v.FindSetting("ProfileToken", "")?.ToString()))
+            .Select(v => $"{v.FindSetting("Identifier", "")}|{v.FindSetting("ProfileToken", "")}")
+            .ToHashSet();
+
+        // Placeholder variables have Identifier but no ProfileToken
+        var existingPlaceholderAddresses = _cache
+            .Where(v => string.IsNullOrEmpty(v.FindSetting("ProfileToken", "")?.ToString())
+                     && !string.IsNullOrEmpty(v.FindSetting("Identifier", "")?.ToString()))
+            .Select(v => v.FindSetting("Identifier", "")?.ToString() ?? "")
+            .ToHashSet();
 
         var existingByName = _cache.Select(v => v.Name).ToHashSet();
 
-        foreach (var device in devices)
+        try
         {
-            var deviceAddress = device.Address ?? "";
-            if (string.IsNullOrEmpty(deviceAddress)) continue;
+            var discovery = new Discovery();
+            int streamsCreated = 0;
+            await foreach (var device in discovery.DiscoverAsync(10))
+            {
+                var xAddr = device.XAddresses.FirstOrDefault(a => a.StartsWith("http"));
+                if (string.IsNullOrEmpty(xAddr)) continue;
+                var deviceAddress = new Uri(xAddr).Authority;
 
-            if (existingByIdentifier.ContainsKey(deviceAddress))
-                continue;
+                var deviceName = device.Model ?? device.Mfr ?? deviceAddress;
+                var deviceSafeName = SanitizeName(deviceName);
 
-            var deviceName = device.Model ?? device.Mfr ?? deviceAddress;
-            var safeName = SanitizeName(deviceName);
-            var fullName = $"{_client.Connector.Name}.{safeName}";
+                IEnumerable<(string Token, string Name)> profiles;
+                try
+                {
+                    using var onvifClient = new Onvif.OnvifClient(deviceAddress, defaultUsername, defaultPassword);
+                    await onvifClient.ConnectAsync();
+                    profiles = await onvifClient.GetProfilesAsync();
+                }
+                catch (Exception ex)
+                {
+                    await _client.LogService().LogError("Onvif", $"Could not connect to '{deviceName}' ({deviceAddress}): {ex.Message}");
+
+                    if (!existingPlaceholderAddresses.Contains(deviceAddress))
+                        await CreatePlaceholderVariableAsync(deviceAddress, deviceName, deviceSafeName, cameraType, existingByName);
+
+                    continue;
+                }
+
+                streamsCreated += await CreateStreamVariablesAsync(deviceAddress, deviceName, deviceSafeName, profiles, cameraType, existingByName, existingStreams);
+            }
+
+            await _client.LogService().LogInformation("Onvif", $"Discovery complete — {streamsCreated} new stream(s) created.");
+        }
+        catch (Exception ex)
+        {
+            await _client.LogService().LogError("Onvif", $"WS-Discovery failed: {ex.Message}");
+        }
+    }
+
+    private async Task CreatePlaceholderVariableAsync(string deviceAddress, string deviceName, string deviceSafeName, DataType cameraType, HashSet<string> existingByName)
+    {
+        var fullName = $"{_rootName}.{deviceSafeName}";
+        if (existingByName.Contains(fullName))
+        {
+            var counter = 2;
+            while (existingByName.Contains($"{fullName}_{counter}")) counter++;
+            fullName = $"{fullName}_{counter}";
+        }
+
+        try
+        {
+            var variable = new Variable
+            {
+                Name = fullName,
+                Comment = deviceName,
+                ConnectorId = _client.Connector._id,
+                IsDirty = true,
+                DirtyReason = "invalid credentials",
+                Settings = cameraType.Settings
+            };
+
+            var result = await _client.VariableService().AddAsync(variable);
+            if (result == null) return;
+            if (result.Settings?.FirstOrDefault(s => s.Key == "Identifier") is { } idSetting)
+                idSetting.Value = deviceAddress;
+            result.OpenWithApp = "eye-viewer";
+            await _client.VariableService().UpdateAsync(result);
+            _cache.Add(result);
+            existingByName.Add(fullName);
+
+            await _client.LogService().LogInformation("Onvif", $"Created placeholder '{fullName}' for '{deviceName}' — set credentials to activate streams.");
+        }
+        catch (Exception ex)
+        {
+            await _client.LogService().LogError("Onvif", $"Failed to create placeholder for '{deviceName}': {ex.Message}");
+        }
+    }
+
+    private async Task<int> CreateStreamVariablesAsync(string deviceAddress, string deviceName, string deviceSafeName, IEnumerable<(string Token, string Name)> profiles, DataType cameraType, HashSet<string> existingByName, HashSet<string> existingStreams, Variable? placeholder = null)
+    {
+        var created = 0;
+        foreach (var (profileToken, profileName) in profiles)
+        {
+            var streamKey = $"{deviceAddress}|{profileToken}";
+            if (existingStreams.Contains(streamKey)) continue;
+
+            var profileSafeName = SanitizeName(profileName);
+            var fullName = $"{_rootName}.{deviceSafeName}.{profileSafeName}";
 
             if (existingByName.Contains(fullName))
             {
                 var counter = 2;
-                while (existingByName.Contains($"{fullName}_{counter}"))
-                    counter++;
+                while (existingByName.Contains($"{fullName}_{counter}")) counter++;
                 fullName = $"{fullName}_{counter}";
             }
 
@@ -171,27 +257,96 @@ public class Connector : StreamerConnector
                 var variable = new Variable
                 {
                     Name = fullName,
-                    Comment = deviceName,
+                    Comment = $"{deviceName} — {profileName}",
                     ConnectorId = _client.Connector._id,
                     DataTypeId = cameraType._id,
                 };
 
                 var result = await _client.VariableService().AddAsync(variable);
-                result.Settings = new List<Setting>
+                if (result == null) continue;
+                if (result.Settings?.FirstOrDefault(s => s.Key == "Identifier") is { } idSetting)
+                    idSetting.Value = deviceAddress;
+                if (result.Settings?.FirstOrDefault(s => s.Key == "ProfileToken") is { } ptSetting)
+                    ptSetting.Value = profileToken;
+                if (placeholder != null)
                 {
-                    new() { Key = "Identifier", Value = deviceAddress }
-                };
+                    if (result.Settings?.FirstOrDefault(s => s.Key == "User") is { } userSetting)
+                        userSetting.Value = placeholder.FindSetting("User", "");
+                    if (result.Settings?.FirstOrDefault(s => s.Key == "Password") is { } passwordSetting)
+                        passwordSetting.Value = placeholder.FindSetting("Password", "");
+                }
+
                 result.OpenWithApp = "eye-viewer";
                 await _client.VariableService().UpdateAsync(result);
-                if (result != null)
-                    _cache.Add(result);
+                _cache.Add(result);
+                existingStreams.Add(streamKey);
+                existingByName.Add(fullName);
 
-                await _client.LogService().LogInformation("Onvif", $"Created variable for camera '{deviceName}' (address: {deviceAddress})");
+                await _client.LogService().LogInformation("Onvif", $"Created stream '{fullName}' (profile: {profileName})");
+                created++;
             }
             catch (Exception ex)
             {
-                await _client.LogService().LogError("Onvif", $"Failed to create variable for device '{deviceName}': {ex.Message}");
+                await _client.LogService().LogError("Onvif", $"Failed to create stream variable '{fullName}': {ex.Message}");
             }
+        }
+        return created;
+    }
+
+    private async Task TryPromotePlaceholderAsync(Variable placeholder)
+    {
+        var deviceAddress = placeholder.FindSetting("Identifier", "")?.ToString() ?? "";
+        if (string.IsNullOrEmpty(deviceAddress)) return;
+
+        var username = placeholder.FindSetting("User", "")?.ToString() ?? "";
+        var password = placeholder.FindSetting("Password", "")?.ToString() ?? "";
+        if (string.IsNullOrEmpty(username))
+        {
+            var connSettings = _client.Connector.Settings ?? [];
+            username = connSettings.Find(s => s.Key == "DefaultUsername")?.Value?.ToString() ?? "";
+            password = connSettings.Find(s => s.Key == "DefaultPassword")?.Value?.ToString() ?? "";
+        }
+
+        IEnumerable<(string Token, string Name)> profiles;
+        try
+        {
+            using var onvifClient = new Onvif.OnvifClient(deviceAddress, username, password);
+            await onvifClient.ConnectAsync();
+            profiles = await onvifClient.GetProfilesAsync();
+        }
+        catch
+        {
+            return; // Credentials still wrong — leave placeholder dirty
+        }
+
+        var cameraType = await _client.DataTypeService().FindWithFilterAsync(Filter.Create(f => f.Eq("Name", "Camera").Eq("IsSystem", true)));
+        if (cameraType == null) return;
+
+        var deviceName = placeholder.Comment ?? deviceAddress;
+        var deviceSafeName = SanitizeName(deviceName);
+
+        var existingStreams = _cache
+            .Where(v => !string.IsNullOrEmpty(v.FindSetting("ProfileToken", "")?.ToString()))
+            .Select(v => $"{v.FindSetting("Identifier", "")}|{v.FindSetting("ProfileToken", "")}")
+            .ToHashSet();
+        var existingByName = _cache.Select(v => v.Name).ToHashSet();
+
+        var created = await CreateStreamVariablesAsync(deviceAddress, deviceName, deviceSafeName, profiles, cameraType, existingByName, existingStreams, placeholder);
+        if (created == 0) return;
+
+        // Mark placeholder as clean — streams are now active
+        try
+        {
+            placeholder.IsDirty = false;
+            placeholder.DirtyReason = null;
+            placeholder.ConnectorId = null;
+            placeholder.Settings = [];
+            await _client.VariableService().UpdateAsync(placeholder);
+            await _client.LogService().LogInformation("Onvif", $"Placeholder '{placeholder.Name}' activated with {created} stream variable(s).");
+        }
+        catch (Exception ex)
+        {
+            await _client.LogService().LogError("Onvif", $"Failed to clear dirty state on '{placeholder.Name}': {ex.Message}");
         }
     }
 
@@ -265,8 +420,9 @@ public class Connector : StreamerConnector
         if (variable.ConnectorId != _client.Connector._id) return;
         _cache.Add(variable);
 
-        var identifier = variable.FindSetting("Identifier", "").ToString();
-        if (!string.IsNullOrEmpty(identifier))
+        var identifier = variable.FindSetting("Identifier", "")?.ToString() ?? "";
+        var profileToken = variable.FindSetting("ProfileToken", "")?.ToString() ?? "";
+        if (!string.IsNullOrEmpty(identifier) && !string.IsNullOrEmpty(profileToken))
         {
             var camera = new OnvifCamera(variable.Name, variable, _client, this);
             _cameras[variable.Name] = camera;
@@ -279,17 +435,9 @@ public class Connector : StreamerConnector
         {
             if (variable.ConnectorId != _client.Connector._id) return;
 
-            Variable? fullVariable = null;
-            try
-            {
-                fullVariable = await _client.VariableService().FindAsync(variable._id!);
-            }
-            catch (Exception ex)
-            {
-                _ = _client.LogService().LogError("Variable", $"Failed to fetch variable {variable._id}: {ex.Message}");
-            }
 
-            var updated = fullVariable ?? variable;
+
+            var updated = variable;
             var old = _cache.FirstOrDefault(v => v._id == updated._id);
             var oldName = old?.Name ?? updated.Name;
 
@@ -304,8 +452,15 @@ public class Connector : StreamerConnector
             else
                 _cache.Add(updated);
 
-            var identifier = updated.FindSetting("Identifier", "").ToString();
-            if (!string.IsNullOrEmpty(identifier))
+            var identifier = updated.FindSetting("Identifier", "")?.ToString() ?? "";
+            var profileToken = updated.FindSetting("ProfileToken", "")?.ToString() ?? "";
+
+            if (!string.IsNullOrEmpty(identifier) && string.IsNullOrEmpty(profileToken) && updated.IsDirty == true)
+            {
+                // Dirty placeholder updated — re-attempt profile discovery with (possibly fixed) credentials
+                await TryPromotePlaceholderAsync(updated);
+            }
+            else if (!string.IsNullOrEmpty(identifier) && !string.IsNullOrEmpty(profileToken))
             {
                 var camera = new OnvifCamera(updated.Name, updated, _client, this);
                 _cameras[updated.Name] = camera;
@@ -337,6 +492,14 @@ public class Connector : StreamerConnector
         }
     }
 
+    private async void HandleConnectorUpdated(Quantum.DevKit.Models.Sense.Connector connector)
+    {
+        if (connector._id != _client.Connector._id) return;
+
+        // updated settings
+        _client.Connector.Settings = connector.Settings;
+    }
+
     public override void Dispose()
     {
         foreach (var camera in _cameras.Values)
@@ -345,6 +508,7 @@ public class Connector : StreamerConnector
         }
 
         _variableEvents?.Dispose();
+        _connectorEvents?.Dispose();
         base.Dispose();
     }
 }
