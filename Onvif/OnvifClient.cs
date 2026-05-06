@@ -42,6 +42,19 @@ public class OnvifClient : IDisposable
         return response.Profiles.Select(p => (p.token, p.Name));
     }
 
+    public async Task<string> GetSnapshotUriAsync(string? profileToken = null)
+    {
+        if (_camera == null)
+            throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
+
+        var token = profileToken ?? _profileToken;
+        if (string.IsNullOrEmpty(token))
+            throw new InvalidOperationException("No media profile available on device.");
+
+        var uri = await _camera.Media.GetSnapshotUriAsync(token);
+        return uri?.Uri ?? throw new Exception("Failed to get snapshot URI from device.");
+    }
+
     public async Task<string> GetStreamUriAsync(string? profileToken = null)
     {
         if (_camera == null)

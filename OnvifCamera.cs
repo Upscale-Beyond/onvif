@@ -1,6 +1,10 @@
+using Onvif.Core.Client;
+using Onvif.Core.Client.Common;
+using Onvif.Core.Client.Ptz;
 using Quantum.DevKit.Connection;
 using Quantum.DevKit.Models.Data;
 using Quantum.DevKit.Models.Streaming;
+using Upscale.Connectors.Onvif.Models;
 using Upscale.Connectors.Onvif.Onvif;
 
 namespace Upscale.Connectors.Onvif;
@@ -17,6 +21,7 @@ public class OnvifCamera
     private readonly Dictionary<string, StreamHandle> _playbackHandles = [];
     private CancellationTokenSource? _monitorCts;
     private readonly SemaphoreSlim _streamLock = new(1, 1);
+    private readonly string _profileToken;
 
     public OnvifCamera(string name, Variable variable, Client client, Connector connector)
     {
@@ -24,6 +29,7 @@ public class OnvifCamera
         Variable = variable;
         _client = client;
         _connector = connector;
+        _profileToken = variable.FindSetting("ProfileToken", "").ToString()!;
     }
 
     public async Task StartStreaming()
@@ -142,27 +148,42 @@ public class OnvifCamera
 
         try
         {
-            if (_onvifClient == null)
-            {
-                var (username, password) = ResolveCredentials();
-                _onvifClient = new OnvifClient(address, username, password);
-                await _onvifClient.ConnectAsync();
-            }
+            var (username, password) = ResolveCredentials();
+            var ptz = await OnvifClientFactory.CreatePTZClientAsync(address, username, password);
 
             switch (cmd.Action)
             {
                 case PtzAction.Move:
                 case PtzAction.Zoom:
-                    await _onvifClient.ContinuousMoveAsync(cmd.Pan, cmd.Tilt, cmd.Zoom, cmd.Speed);
+                    await ptz.ContinuousMoveAsync(_profileToken, new PTZSpeed
+                    {
+                        PanTilt = new()
+                        {
+                            x = cmd.Pan,
+                            y = cmd.Tilt
+                        },
+                        Zoom = new()
+                        {
+                            x = cmd.Zoom
+                        }
+                    }, null);
+                    var ptz_status = await ptz.GetStatusAsync(_profileToken);
+                    await _client.StateService().SetStateAsync($"{Variable.Name}.PtzStatus.Pan", ptz_status.Position?.PanTilt?.x ?? -255);
+                    await _client.StateService().SetStateAsync($"{Variable.Name}.PtzStatus.Tilt", ptz_status.Position?.PanTilt?.y ?? -255);
+                    await _client.StateService().SetStateAsync($"{Variable.Name}.PtzStatus.Zoom", ptz_status.Position?.Zoom?.x ?? -255);
                     break;
 
                 case PtzAction.Stop:
-                    await _onvifClient.StopAsync();
+                    await ptz.StopAsync(_profileToken, true, true);
                     break;
 
                 case PtzAction.GoToPreset:
                     if (cmd.PresetId.HasValue)
-                        await _onvifClient.GotoPresetAsync(cmd.PresetId.Value);
+                    {
+                        var presets = await ptz.GetPresetsAsync(_profileToken);
+                        var preset = presets.Preset[cmd.PresetId.Value];
+                        await ptz.GotoPresetAsync(_profileToken, preset.token, null);
+                    }
                     break;
 
                 case PtzAction.SetPreset:
@@ -175,6 +196,155 @@ public class OnvifCamera
         }
     }
 
+    public async Task AbsolutePtzAsync(dynamic value)
+    {
+        var address = Variable.FindSetting("Identifier", "").ToString();
+        if (string.IsNullOrEmpty(address)) return;
+
+        var (username, password) = ResolveCredentials();
+
+        try
+        {
+            var json = value?.ToString() ?? "";
+            var pos = System.Text.Json.JsonSerializer.Deserialize<PtzPosition>(json);
+            if (pos == null) return;
+
+            var ptz = await OnvifClientFactory.CreatePTZClientAsync(address, username, password);
+            await ptz.AbsoluteMoveAsync(_profileToken, new PTZVector
+            {
+                PanTilt = new Vector2D { x = (float)pos.Pan, y = (float)pos.Tilt },
+                Zoom = new Vector1D { x = (float)pos.Zoom }
+            }, null);
+
+            var ptz_status = await ptz.GetStatusAsync(_profileToken);
+            var state = _client.StateService();
+            await state.SetStateAsync($"{Name}.PtzStatus.Pan", ptz_status.Position?.PanTilt?.x ?? -255);
+            await state.SetStateAsync($"{Name}.PtzStatus.Tilt", ptz_status.Position?.PanTilt?.y ?? -255);
+            await state.SetStateAsync($"{Name}.PtzStatus.Zoom", ptz_status.Position?.Zoom?.x ?? -255);
+        }
+        catch (Exception ex)
+        {
+            await _client.LogService().LogError("PTZ", $"Absolute move failed for {Name}: {ex.Message}");
+        }
+    }
+
+    public async Task HandlePresetCmdAsync(dynamic value)
+    {
+        var address = Variable.FindSetting("Identifier", "").ToString();
+        if (string.IsNullOrEmpty(address)) return;
+
+        var (username, password) = ResolveCredentials();
+
+        try
+        {
+            var json = value?.ToString() ?? "";
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            var command = root.GetProperty("command").GetString()?.ToLowerInvariant() ?? "";
+            var ptz = await OnvifClientFactory.CreatePTZClientAsync(address, username, password);
+
+            switch (command)
+            {
+                case "goto":
+                {
+                    var token = root.GetProperty("id").GetString() ?? "";
+                    if (string.IsNullOrEmpty(token)) return;
+                    await ptz.GotoPresetAsync(_profileToken, token, null);
+                    await _client.LogService().LogInformation("Preset", $"{Name}: Activated preset '{token}'");
+                    break;
+                }
+                case "create":
+                {
+                    var name = root.GetProperty("name").GetString() ?? "Preset";
+                    var result = await ptz.SetPresetAsync(new SetPresetRequest
+                    {
+                        ProfileToken = _profileToken,
+                        PresetName = name
+                    });
+                    await _client.LogService().LogInformation("Preset", $"{Name}: Created preset '{result.PresetToken}'");
+                    break;
+                }
+                case "update":
+                {
+                    var token = root.GetProperty("id").GetString() ?? "";
+                    var name = root.GetProperty("name").GetString() ?? "";
+                    if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(name)) return;
+                    await ptz.SetPresetAsync(new SetPresetRequest
+                    {
+                        ProfileToken = _profileToken,
+                        PresetToken = token,
+                        PresetName = name
+                    });
+                    await _client.LogService().LogInformation("Preset", $"{Name}: Updated preset '{token}' to '{name}'");
+                    break;
+                }
+                case "delete":
+                {
+                    var token = root.GetProperty("id").GetString() ?? "";
+                    if (string.IsNullOrEmpty(token)) return;
+                    await ptz.RemovePresetAsync(_profileToken, token);
+                    await _client.LogService().LogInformation("Preset", $"{Name}: Deleted preset '{token}'");
+                    break;
+                }
+                default:
+                    await _client.LogService().LogError("Preset", $"{Name}: Unknown command '{command}'");
+                    return;
+            }
+
+            await RefreshPresetsAsync(address, username, password);
+        }
+        catch (Exception ex)
+        {
+            await _client.LogService().LogError("Preset", $"Preset command failed for {Name}: {ex.Message}");
+        }
+    }
+
+    public async Task HandleSnapshotCmdAsync(dynamic value)
+    {
+        var address = Variable.FindSetting("Identifier", "").ToString();
+        if (string.IsNullOrEmpty(address)) return;
+
+        try
+        {
+            var (username, password) = ResolveCredentials();
+            using var onvifClient = new OnvifClient(address, username, password);
+            await onvifClient.ConnectAsync();
+            var snapshotUrl = await onvifClient.GetSnapshotUriAsync(_profileToken);
+
+            using var http = new HttpClient();
+            var imageData = await http.GetByteArrayAsync(snapshotUrl);
+            if (imageData == null || imageData.Length == 0)
+            {
+                await _client.LogService().LogError("Snapshot", $"{Name}: Empty snapshot image");
+                return;
+            }
+
+            var snapshotName = value?.ToString() ?? $"{Name}.jpg";
+            await _client.SnapshotService().UploadAsync(imageData, snapshotName);
+            await _client.LogService().LogInformation("Snapshot", $"{Name}: Snapshot uploaded as '{snapshotName}'");
+        }
+        catch (Exception ex)
+        {
+            await _client.LogService().LogError("Snapshot", $"Snapshot failed for {Name}: {ex.Message}");
+        }
+    }
+
+    private async Task RefreshPresetsAsync(string address, string username, string password)
+    {
+        try
+        {
+            var ptz = await OnvifClientFactory.CreatePTZClientAsync(address, username, password);
+            var response = await ptz.GetPresetsAsync(_profileToken);
+            var presets = response.Preset?.Select(p => new { id = p.token, name = p.Name }).ToList() ?? [];
+            await _client.StateService().SetStateAsync($"{Name}.Presets", presets);
+        }
+        catch (Exception ex)
+        {
+            _ = _client.LogService().LogError("Preset", $"{Name}: Failed to refresh presets: {ex.Message}");
+        }
+    }
+
     public async Task<bool> CheckReachableAsync()
     {
         var address = Variable.FindSetting("Identifier", "").ToString();
@@ -183,6 +353,52 @@ public class OnvifCamera
         var (username, password) = ResolveCredentials();
         var client = new OnvifClient(address, username, password);
         return await client.IsReachableAsync();
+    }
+
+    public async Task CheckCapabilitiesAsync()
+    {
+        var address = Variable.FindSetting("Identifier", "").ToString();
+        if (string.IsNullOrEmpty(address)) return;
+
+        var profileToken = Variable.FindSetting("ProfileToken", "").ToString();
+        if (string.IsNullOrWhiteSpace(profileToken)) return;
+
+        var (username, password) = ResolveCredentials();
+
+        try
+        {
+            var device = await OnvifClientFactory.CreateDeviceClientAsync(address, username, password);
+            var media = await OnvifClientFactory.CreateMediaClientAsync(address, username, password);
+
+            var caps = await device.GetCapabilitiesAsync([CapabilityCategory.All]);
+            var profile = await media.GetProfileAsync(profileToken);
+
+            var hasPtz = caps.Capabilities.PTZ != null && profile.PTZConfiguration != null;
+            var hasAudio = profile.AudioEncoderConfiguration != null;
+            var hasAnalytics = caps.Capabilities.Analytics != null;
+
+            // ONVIF basic profile cameras don't expose recording/export control — those are NVR-side
+            var hasRecording = false;
+            var hasExports = false;
+
+            // All ONVIF cameras with a media profile support GetSnapshotUri
+            var hasSnapshots = true;
+
+            var state = _client.StateService();
+            await state.SetStateAsync($"{Name}.Capabilities.Ptz", hasPtz);
+            await state.SetStateAsync($"{Name}.Capabilities.Recording", hasRecording);
+            await state.SetStateAsync($"{Name}.Capabilities.Audio", hasAudio);
+            await state.SetStateAsync($"{Name}.Capabilities.Analytics", hasAnalytics);
+            await state.SetStateAsync($"{Name}.Capabilities.Exports", hasExports);
+            await state.SetStateAsync($"{Name}.Capabilities.Snapshots", hasSnapshots);
+
+            if (hasPtz)
+                await RefreshPresetsAsync(address, username, password);
+        }
+        catch (Exception ex)
+        {
+            _ = _client.LogService().LogError("Capabilities", $"{Name}: Failed to check capabilities: {ex.Message}");
+        }
     }
 
     private (string username, string password) ResolveCredentials()

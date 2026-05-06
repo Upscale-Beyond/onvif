@@ -14,6 +14,7 @@ public class Connector : StreamerConnector
     private readonly Dictionary<string, OnvifCamera> _cameras = new();
 
     private NotificationEventListener<Variable>? _variableEvents;
+    private NotificationEventListener<State>? _stateEvents;
     private NotificationEventListener<Quantum.DevKit.Models.Sense.Connector>? _connectorEvents;
 
     private string _rootName;
@@ -23,10 +24,12 @@ public class Connector : StreamerConnector
 
         _variableEvents = client.VariableService(true).Events!;
         _connectorEvents = client.ConnectorService(true).Events!;
+        _stateEvents = client.StateService(true).Events!;
         _variableEvents.On("added", HandleVariableAdded);
         _variableEvents.On("updated", HandleVariableUpdated);
         _variableEvents.On("removed", HandleVariableRemoved);
         _connectorEvents.On("updated", HandleConnectorUpdated);
+        _stateEvents.On("updated", HandleStateUpdated);
         _cache.AddRange(await _client.GetMyVariablesAsync());
         _rootName = _client.Connector.FindSetting("RootName", _client.Connector.Name).ToString()!;
 
@@ -91,10 +94,12 @@ public class Connector : StreamerConnector
             {
                 var reachable = await camera.CheckReachableAsync();
                 await ReportCameraStatus(camera.Name, reachable ? "Online" : "Offline");
+                await camera.CheckCapabilitiesAsync();
             }
-            catch
+            catch (Exception ex)
             {
                 await ReportCameraStatus(camera.Name, "Offline");
+                await _client.LogService().LogError(camera.Name, ex.Message);
             }
         }
     }
@@ -409,7 +414,6 @@ public class Connector : StreamerConnector
             v.Name == cameraName ||
             v.Name.Split('.').Last().Equals(cameraName, StringComparison.OrdinalIgnoreCase));
     }
-
     private static string SanitizeName(string name)
     {
         return new string(name.Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray()).Trim('_');
@@ -500,6 +504,21 @@ public class Connector : StreamerConnector
         _client.Connector.Settings = connector.Settings;
     }
 
+    private async void HandleStateUpdated(State state)
+    {
+        if (state.VariableName == null) return;
+
+        var cameraVariable = _cache.FirstOrDefault(v => state.VariableName.StartsWith(v.Name + "."));
+        if (cameraVariable == null) return;
+        if (!_cameras.TryGetValue(cameraVariable.Name, out var camera)) return;
+
+        if (state.VariableName.EndsWith(".PtzCmd"))
+            await camera.AbsolutePtzAsync(state.Value);
+        else if (state.VariableName.EndsWith(".PresetCmd"))
+            await camera.HandlePresetCmdAsync(state.Value);
+        else if (state.VariableName.EndsWith(".SnapshotCmd"))
+            await camera.HandleSnapshotCmdAsync(state.Value);
+    }
     public override void Dispose()
     {
         foreach (var camera in _cameras.Values)
